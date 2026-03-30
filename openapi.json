@@ -1,0 +1,214 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "YouTube Transcript API",
+    "description": "Holt YouTube-Transkripte als Plaintext, Segmente oder SRT. Ideal als Tool fuer KI-Assistenten.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://yt-transcript.sac.sh",
+      "description": "Production"
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Service Info",
+        "operationId": "root",
+        "responses": {
+          "200": {
+            "description": "Service-Info mit Endpunkt-Uebersicht"
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health Check",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Status ok"
+          }
+        }
+      }
+    },
+    "/transcript": {
+      "get": {
+        "summary": "Transkript abrufen",
+        "description": "Holt das Transkript eines YouTube-Videos als Plaintext, Segmente oder SRT.",
+        "operationId": "get_transcript",
+        "security": [{"HTTPBearer": []}],
+        "parameters": [
+          {
+            "name": "video",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"},
+            "description": "YouTube-URL (alle Formate: watch, youtu.be, shorts, embed, live) oder 11-Zeichen Video-ID"
+          },
+          {
+            "name": "lang",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string", "default": "de,en"},
+            "description": "Kommaseparierte Sprachcodes in Prioritaetsreihenfolge"
+          },
+          {
+            "name": "timestamps",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "boolean", "default": false},
+            "description": "Timestamps im Plaintext mitliefern"
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string", "enum": ["text", "segments", "srt"], "default": "text"},
+            "description": "Ausgabeformat"
+          },
+          {
+            "name": "max_chars",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "integer"},
+            "description": "Maximale Zeichenanzahl (nur bei format=text)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Transkript erfolgreich abgerufen",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "video_id": {"type": "string"},
+                    "language": {"type": "array", "items": {"type": "string"}},
+                    "metadata": {
+                      "type": "object",
+                      "properties": {
+                        "title": {"type": "string"},
+                        "author": {"type": "string"},
+                        "author_url": {"type": "string"},
+                        "thumbnail": {"type": "string"}
+                      }
+                    },
+                    "text": {"type": "string"}
+                  }
+                }
+              }
+            }
+          },
+          "400": {"description": "Ungueltige Video-URL oder ID"},
+          "401": {"description": "Unauthorized"},
+          "404": {"description": "Video nicht verfuegbar oder keine Transkripte"},
+          "500": {"description": "Serverfehler"}
+        }
+      }
+    },
+    "/transcript/batch": {
+      "post": {
+        "summary": "Batch-Transkripte abrufen",
+        "description": "Holt Transkripte fuer mehrere Videos auf einmal (max. 10).",
+        "operationId": "get_transcripts_batch",
+        "security": [{"HTTPBearer": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["videos"],
+                "properties": {
+                  "videos": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Liste von YouTube-URLs oder Video-IDs (max. 10)"
+                  },
+                  "lang": {"type": "string", "default": "de,en"},
+                  "timestamps": {"type": "boolean", "default": false},
+                  "format": {"type": "string", "enum": ["text", "segments", "srt"], "default": "text"},
+                  "max_chars": {"type": "integer"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Batch-Ergebnisse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "results": {
+                      "type": "array",
+                      "items": {"type": "object"}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/transcript/list": {
+      "get": {
+        "summary": "Verfuegbare Sprachen auflisten",
+        "description": "Listet alle verfuegbaren Transkript-Sprachen fuer ein Video.",
+        "operationId": "list_transcripts",
+        "security": [{"HTTPBearer": []}],
+        "parameters": [
+          {
+            "name": "video",
+            "in": "query",
+            "required": true,
+            "schema": {"type": "string"},
+            "description": "YouTube-URL oder Video-ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Liste der verfuegbaren Transkripte",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "video_id": {"type": "string"},
+                    "metadata": {"type": "object"},
+                    "available_transcripts": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "language": {"type": "string"},
+                          "language_code": {"type": "string"},
+                          "is_generated": {"type": "boolean"},
+                          "is_translatable": {"type": "boolean"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "HTTPBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}

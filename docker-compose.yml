@@ -1,0 +1,31 @@
+services:
+  yt-transcript-api:
+    build: .
+    image: benscheurerde/yt-transcript:latest
+    container_name: yt-transcript-api
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Berlin
+      - API_TOKEN=${API_TOKEN}
+      - REDIS_URL=${REDIS_URL:-redis://yt-transcript-redis:6379}
+      - CACHE_TTL=${CACHE_TTL:-3600}
+    networks:
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.yt-transcript.rule=Host(`yt-transcript.sac.sh`)"
+      - "traefik.http.routers.yt-transcript.entrypoints=websecure"
+      - "traefik.http.routers.yt-transcript.tls.certresolver=cloudflare"
+      - "traefik.http.services.yt-transcript.loadbalancer.server.port=8000"
+
+  redis:
+    image: redis:7-alpine
+    container_name: yt-transcript-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
