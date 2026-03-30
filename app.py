@@ -10,6 +10,7 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     VideoUnavailable,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig
 
 app = FastAPI(
     title="YouTube Transcript API",
@@ -20,6 +21,9 @@ app = FastAPI(
 security = HTTPBearer(auto_error=False)
 
 API_TOKEN = os.environ.get("API_TOKEN")
+
+# Optional SOCKS5 Proxy (z.B. Tor)
+PROXY_URL = os.environ.get("PROXY_URL")
 
 # Optional Redis
 REDIS_URL = os.environ.get("REDIS_URL")
@@ -108,9 +112,19 @@ def _format_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _make_ytt_api() -> YouTubeTranscriptApi:
+    if PROXY_URL:
+        proxy_config = GenericProxyConfig(
+            http_url=PROXY_URL,
+            https_url=PROXY_URL,
+        )
+        return YouTubeTranscriptApi(proxy_config=proxy_config)
+    return YouTubeTranscriptApi()
+
+
 def _fetch_transcript(video_id: str, languages: list[str]):
     try:
-        ytt_api = YouTubeTranscriptApi()
+        ytt_api = _make_ytt_api()
         transcript = ytt_api.fetch(video_id, languages=languages)
         return transcript
     except NoTranscriptFound:
@@ -175,7 +189,8 @@ def root():
 @app.get("/health")
 def health():
     redis_status = "connected" if _get_redis() else ("not configured" if not REDIS_URL else "error")
-    return {"status": "ok", "redis": redis_status}
+    proxy_status = PROXY_URL if PROXY_URL else "not configured"
+    return {"status": "ok", "redis": redis_status, "proxy": proxy_status}
 
 
 @app.get("/transcript")
@@ -325,7 +340,7 @@ def list_transcripts(
     video_id = _extract_video_id(video)
 
     try:
-        ytt_api = YouTubeTranscriptApi()
+        ytt_api = _make_ytt_api()
         transcript_list = ytt_api.list(video_id)
         available = []
         for t in transcript_list:

@@ -4,11 +4,15 @@ services:
     image: benscheurerde/yt-transcript:latest
     container_name: yt-transcript-api
     restart: unless-stopped
+    depends_on:
+      - redis
+      - tor
     environment:
       - TZ=Europe/Berlin
       - API_TOKEN=${API_TOKEN}
       - REDIS_URL=${REDIS_URL:-redis://yt-transcript-redis:6379}
       - CACHE_TTL=${CACHE_TTL:-3600}
+      - PROXY_URL=${PROXY_URL:-socks5://yt-transcript-tor:9050}
     networks:
       - dokploy-network
     labels:
@@ -23,6 +27,15 @@ services:
     container_name: yt-transcript-redis
     restart: unless-stopped
     command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+    networks:
+      - dokploy-network
+
+  tor:
+    image: dperson/torproxy
+    container_name: yt-transcript-tor
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Berlin
     networks:
       - dokploy-network
 
