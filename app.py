@@ -1,18 +1,17 @@
 import json
 import os
 import re
-import subprocess
-import tempfile
 from typing import Optional
 
+import requests
 from fastapi import FastAPI, HTTPException, Query, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 app = FastAPI(
     title="YouTube Transcript API",
-    description="Holt YouTube-Transkripte als Plaintext, Segmente oder SRT. Nutzt yt-dlp als Backend.",
-    version="2.0.0",
+    description="Holt YouTube-Transkripte als Plaintext, Segmente oder SRT. Nutzt YouTube Innertube API.",
+    version="2.1.0",
 )
 
 security = HTTPBearer(auto_error=False)
@@ -23,7 +22,23 @@ API_TOKEN = os.environ.get("API_TOKEN")
 REDIS_URL = os.environ.get("REDIS_URL")
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
 
+# YouTube Innertube API
+INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+INNERTUBE_CLIENT_VERSION = "2.20240313.05.00"
+
 _redis = None
+_session = None
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+        })
+    return _session
 
 
 def _get_redis():
@@ -33,9 +48,8 @@ def _get_redis():
     if not REDIS_URL:
         return None
     try:
-        import redis
-
-        _redis = redis.from_url(REDIS_URL, decode_responses=True)
+        import redis as redis_lib
+        _redis = redis_lib.from_url(REDIS_URL, decode_responses=True)
         _redis.ping()
         return _redis
     except Exception:
@@ -106,37 +120,142 @@ def _format_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _innertube_context():
+    return {
+        "client": {
+            "clientName": "WEB",
+            "clientVersion": INNERTUBE_CLIENT_VERSION,
+            "hl": "de",
+            "gl": "DE",
+        }
+    }
+
+
+def _get_caption_tracks(video_id: str) -> list[dict]:
+    """Holt Caption Tracks ueber die Innertube Player API."""
+    session = _get_session()
+    resp = session.post(
+        f"https://www.youtube.com/youtubei/v1/player?key={INNERTUBE_API_KEY}",
+        json={
+            "context": _innertube_context(),
+            "videoId": video_id,
+        },
+        timeout=15,
+    )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"YouTube API Fehler: {resp.status_code}")
+
+    data = resp.json()
+
+    # Check playability
+    playability = data.get("playabilityStatus", {})
+    status = playability.get("status")
+    if status == "ERROR":
+        raise HTTPException(status_code=404, detail="Video nicht verfuegbar.")
+    if status == "LOGIN_REQUIRED":
+        raise HTTPException(status_code=403, detail="Video ist privat oder altersbeschraenkt.")
+
+    captions = data.get("captions", {})
+    renderer = captions.get("playerCaptionsTracklistRenderer", {})
+    tracks = renderer.get("captionTracks", [])
+
+    return tracks
+
+
+def _fetch_transcript_from_url(base_url: str) -> list[dict]:
+    """Holt und parst Transkript von einer Caption Track URL."""
+    # JSON3 Format anfordern (strukturiert, einfach zu parsen)
+    url = base_url + "&fmt=json3"
+    session = _get_session()
+    resp = session.get(url, timeout=15)
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Transkript konnte nicht geladen werden.")
+
+    data = resp.json()
+    events = data.get("events", [])
+    segments = []
+
+    for event in events:
+        segs = event.get("segs")
+        if not segs:
+            continue
+        start_ms = event.get("tStartMs", 0)
+        duration_ms = event.get("dDurationMs", 0)
+        text = "".join(s.get("utf8", "") for s in segs).strip()
+        text = text.replace("\n", " ")
+        if text:
+            segments.append({
+                "start": round(start_ms / 1000, 3),
+                "duration": round(duration_ms / 1000, 3),
+                "text": text,
+            })
+
+    return segments
+
+
+def _fetch_transcript(video_id: str, languages: list[str]) -> tuple[list[dict], str]:
+    """Holt Transkript. Gibt (segments, language_code) zurueck."""
+    tracks = _get_caption_tracks(video_id)
+
+    if not tracks:
+        raise HTTPException(
+            status_code=404,
+            detail="Keine Transkripte fuer dieses Video verfuegbar.",
+        )
+
+    # Suche Track in gewuenschter Sprache
+    chosen_track = None
+    chosen_lang = None
+
+    for lang in languages:
+        for track in tracks:
+            if track.get("languageCode", "").startswith(lang):
+                chosen_track = track
+                chosen_lang = lang
+                break
+        if chosen_track:
+            break
+
+    # Fallback: erster verfuegbarer Track
+    if not chosen_track:
+        chosen_track = tracks[0]
+        chosen_lang = chosen_track.get("languageCode", "unknown")
+
+    base_url = chosen_track.get("baseUrl")
+    if not base_url:
+        raise HTTPException(status_code=500, detail="Keine Transkript-URL gefunden.")
+
+    segments = _fetch_transcript_from_url(base_url)
+
+    if not segments:
+        raise HTTPException(status_code=404, detail="Transkript ist leer.")
+
+    return segments, chosen_lang
+
+
 def _get_metadata(video_id: str) -> dict:
-    """Metadaten via yt-dlp abrufen (kein API Key noetig)."""
+    """Metadaten via oembed API (kein API Key noetig, funktioniert von Datacenter IPs)."""
     cache_key = f"meta:{video_id}"
     cached = _cache_get(cache_key)
     if cached:
         return json.loads(cached)
 
     try:
-        result = subprocess.run(
-            [
-                "yt-dlp",
-                "--dump-json",
-                "--skip-download",
-                "--no-warnings",
-                f"https://www.youtube.com/watch?v={video_id}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
+        session = _get_session()
+        resp = session.get(
+            f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json",
+            timeout=5,
         )
-        if result.returncode != 0:
+        if resp.status_code != 200:
             return {}
-        data = json.loads(result.stdout)
+        data = resp.json()
         meta = {
             "title": data.get("title"),
-            "author": data.get("uploader") or data.get("channel"),
-            "author_url": data.get("uploader_url") or data.get("channel_url"),
-            "thumbnail": data.get("thumbnail"),
-            "duration": data.get("duration"),
-            "upload_date": data.get("upload_date"),
-            "view_count": data.get("view_count"),
+            "author": data.get("author_name"),
+            "author_url": data.get("author_url"),
+            "thumbnail": data.get("thumbnail_url"),
         }
         _cache_set(cache_key, json.dumps(meta))
         return meta
@@ -144,208 +263,11 @@ def _get_metadata(video_id: str) -> dict:
         return {}
 
 
-def _parse_vtt(vtt_content: str) -> list[dict]:
-    """Parst VTT-Untertitel in eine Liste von Segmenten."""
-    segments = []
-    lines = vtt_content.strip().split("\n")
-    i = 0
-    while i < len(lines):
-        # Suche nach Timestamp-Zeilen (00:00:00.000 --> 00:00:01.000)
-        if "-->" in lines[i]:
-            time_parts = lines[i].split("-->")
-            start = _parse_vtt_time(time_parts[0].strip())
-            end = _parse_vtt_time(time_parts[1].strip())
-            # Sammle Text-Zeilen bis zur naechsten Leerzeile
-            text_lines = []
-            i += 1
-            while i < len(lines) and lines[i].strip():
-                # VTT Tags entfernen
-                clean = re.sub(r"<[^>]+>", "", lines[i].strip())
-                if clean:
-                    text_lines.append(clean)
-                i += 1
-            if text_lines:
-                segments.append({
-                    "start": start,
-                    "duration": round(end - start, 3),
-                    "text": " ".join(text_lines),
-                })
-        else:
-            i += 1
-    # Deduplizieren (VTT hat oft doppelte Zeilen)
-    deduped = []
-    seen_texts = set()
-    for seg in segments:
-        if seg["text"] not in seen_texts:
-            deduped.append(seg)
-            seen_texts.add(seg["text"])
-    return deduped
-
-
-def _parse_vtt_time(time_str: str) -> float:
-    """Parst VTT Timestamp (00:00:00.000) in Sekunden."""
-    time_str = time_str.strip()
-    parts = time_str.replace(",", ".").split(":")
-    if len(parts) == 3:
-        return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-    elif len(parts) == 2:
-        return float(parts[0]) * 60 + float(parts[1])
-    return float(parts[0])
-
-
-def _fetch_transcript(video_id: str, languages: list[str]) -> list[dict]:
-    """Holt Transkript via yt-dlp."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Versuche erst manuell erstellte Untertitel, dann auto-generierte
-        lang_str = ",".join(languages)
-        output_path = os.path.join(tmpdir, "sub")
-
-        result = subprocess.run(
-            [
-                "yt-dlp",
-                "--write-subs",
-                "--write-auto-subs",
-                "--sub-langs", lang_str,
-                "--sub-format", "vtt",
-                "--skip-download",
-                "--no-warnings",
-                "-o", output_path,
-                url,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            if "Video unavailable" in stderr or "Private video" in stderr:
-                raise HTTPException(status_code=404, detail="Video nicht verfuegbar.")
-            raise HTTPException(status_code=500, detail=f"yt-dlp Fehler: {stderr[:500]}")
-
-        # Suche nach heruntergeladener VTT-Datei
-        import glob
-        vtt_files = glob.glob(os.path.join(tmpdir, "*.vtt"))
-
-        if not vtt_files:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Kein Transkript in den Sprachen {languages} verfuegbar.",
-            )
-
-        # Bevorzuge manuell erstellte vor auto-generierten
-        chosen_file = vtt_files[0]
-        for f in vtt_files:
-            # Dateien ohne ".auto." im Namen bevorzugen
-            if not re.search(r"\.auto\.", os.path.basename(f)):
-                chosen_file = f
-                break
-
-        with open(chosen_file, "r", encoding="utf-8") as f:
-            vtt_content = f.read()
-
-        return _parse_vtt(vtt_content)
-
-
-def _list_available_subs(video_id: str) -> list[dict]:
-    """Listet verfuegbare Untertitel-Sprachen via yt-dlp."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-
-    result = subprocess.run(
-        [
-            "yt-dlp",
-            "--list-subs",
-            "--skip-download",
-            "--no-warnings",
-            url,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if "Video unavailable" in stderr or "Private video" in stderr:
-            raise HTTPException(status_code=404, detail="Video nicht verfuegbar.")
-        raise HTTPException(status_code=500, detail=f"yt-dlp Fehler: {stderr[:500]}")
-
-    subs = []
-    output = result.stdout
-    in_manual = False
-    in_auto = False
-
-    for line in output.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        if "Available subtitles" in line:
-            in_manual = True
-            in_auto = False
-            continue
-        if "Available automatic captions" in line:
-            in_auto = True
-            in_manual = False
-            continue
-
-        if in_manual or in_auto:
-            # Format: "de       vtt, ..." oder "de  German    vtt, ..."
-            parts = line.split()
-            if len(parts) >= 2 and len(parts[0]) <= 10:
-                lang_code = parts[0]
-                # Versuche Sprachnamen zu extrahieren
-                lang_name = ""
-                for p in parts[1:]:
-                    if p in ("vtt", "ttml", "srv1", "srv2", "srv3", "json3"):
-                        break
-                    lang_name += p + " "
-                lang_name = lang_name.strip()
-
-                subs.append({
-                    "language": lang_name or lang_code,
-                    "language_code": lang_code,
-                    "is_generated": in_auto,
-                    "is_translatable": in_auto,
-                })
-
-    return subs
-
-
-@app.get("/")
-def root():
-    return {
-        "service": "YouTube Transcript API",
-        "version": "2.0.0",
-        "backend": "yt-dlp",
-        "endpoints": {
-            "GET /transcript": "Transkript eines Videos abrufen",
-            "POST /transcript/batch": "Transkripte mehrerer Videos abrufen",
-            "GET /transcript/list": "Verfuegbare Sprachen auflisten",
-            "GET /health": "Health Check",
-            "GET /openapi.json": "OpenAPI Spec",
-        },
-    }
-
-
-@app.get("/health")
-def health():
-    redis_status = "connected" if _get_redis() else ("not configured" if not REDIS_URL else "error")
-    # Check yt-dlp version
-    try:
-        result = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=5)
-        ytdlp_version = result.stdout.strip() if result.returncode == 0 else "error"
-    except Exception:
-        ytdlp_version = "not installed"
-    return {"status": "ok", "redis": redis_status, "yt_dlp": ytdlp_version}
-
-
-def _build_result(video_id: str, languages: list[str], segments: list[dict], metadata: dict, fmt: str, timestamps: bool, max_chars: Optional[int]):
+def _build_result(video_id: str, language: str, segments: list[dict], metadata: dict, fmt: str, timestamps: bool, max_chars: Optional[int]):
     if fmt == "segments":
         return {
             "video_id": video_id,
-            "language": languages,
+            "language": language,
             "metadata": metadata or None,
             "segments": segments,
         }
@@ -357,7 +279,7 @@ def _build_result(video_id: str, languages: list[str], segments: list[dict], met
             srt_lines.append(f"{i}\n{start_time} --> {end_time}\n{s['text']}\n")
         return {
             "video_id": video_id,
-            "language": languages,
+            "language": language,
             "metadata": metadata or None,
             "srt": "\n".join(srt_lines),
         }
@@ -371,10 +293,32 @@ def _build_result(video_id: str, languages: list[str], segments: list[dict], met
             text = text[:max_chars] + "..."
         return {
             "video_id": video_id,
-            "language": languages,
+            "language": language,
             "metadata": metadata or None,
             "text": text,
         }
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "YouTube Transcript API",
+        "version": "2.1.0",
+        "backend": "innertube",
+        "endpoints": {
+            "GET /transcript": "Transkript eines Videos abrufen",
+            "POST /transcript/batch": "Transkripte mehrerer Videos abrufen",
+            "GET /transcript/list": "Verfuegbare Sprachen auflisten",
+            "GET /health": "Health Check",
+            "GET /openapi.json": "OpenAPI Spec",
+        },
+    }
+
+
+@app.get("/health")
+def health():
+    redis_status = "connected" if _get_redis() else ("not configured" if not REDIS_URL else "error")
+    return {"status": "ok", "redis": redis_status, "backend": "innertube"}
 
 
 @app.get("/transcript")
@@ -395,9 +339,9 @@ def get_transcript(
     if cached:
         return json.loads(cached)
 
-    segments = _fetch_transcript(video_id, languages)
+    segments, found_lang = _fetch_transcript(video_id, languages)
     metadata = _get_metadata(video_id)
-    result = _build_result(video_id, languages, segments, metadata, format, timestamps, max_chars)
+    result = _build_result(video_id, found_lang, segments, metadata, format, timestamps, max_chars)
 
     _cache_set(cache_key, json.dumps(result))
     return result
@@ -426,9 +370,9 @@ def get_transcripts_batch(
     for video in body.videos:
         try:
             video_id = _extract_video_id(video)
-            segments = _fetch_transcript(video_id, languages)
+            segments, found_lang = _fetch_transcript(video_id, languages)
             metadata = _get_metadata(video_id)
-            entry = _build_result(video_id, languages, segments, metadata, body.format, body.timestamps, body.max_chars)
+            entry = _build_result(video_id, found_lang, segments, metadata, body.format, body.timestamps, body.max_chars)
             results.append(entry)
         except HTTPException as e:
             results.append({"video_id": video, "error": e.detail})
@@ -445,8 +389,17 @@ def list_transcripts(
 ):
     _verify_token(credentials)
     video_id = _extract_video_id(video)
-    available = _list_available_subs(video_id)
+    tracks = _get_caption_tracks(video_id)
     metadata = _get_metadata(video_id)
+
+    available = []
+    for t in tracks:
+        available.append({
+            "language": t.get("name", {}).get("simpleText", t.get("languageCode", "")),
+            "language_code": t.get("languageCode", ""),
+            "is_generated": t.get("kind") == "asr",
+            "is_translatable": bool(t.get("isTranslatable")),
+        })
 
     return {
         "video_id": video_id,
