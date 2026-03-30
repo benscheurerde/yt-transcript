@@ -10,8 +10,8 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="YouTube Transcript API",
-    description="Holt YouTube-Transkripte als Plaintext, Segmente oder SRT. Nutzt YouTube Innertube API.",
-    version="2.1.0",
+    description="Holt YouTube-Transkripte als Plaintext, Segmente oder SRT.",
+    version="3.0.0",
 )
 
 security = HTTPBearer(auto_error=False)
@@ -21,10 +21,6 @@ API_TOKEN = os.environ.get("API_TOKEN")
 # Optional Redis
 REDIS_URL = os.environ.get("REDIS_URL")
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
-
-# YouTube Innertube API
-INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-INNERTUBE_CLIENT_VERSION = "2.20240313.05.00"
 
 _redis = None
 _session = None
@@ -37,6 +33,7 @@ def _get_session() -> requests.Session:
         _session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
     return _session
 
@@ -120,53 +117,89 @@ def _format_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def _innertube_context():
-    return {
-        "client": {
-            "clientName": "WEB",
-            "clientVersion": INNERTUBE_CLIENT_VERSION,
-            "hl": "de",
-            "gl": "DE",
-        }
-    }
+def _get_video_data(video_id: str) -> dict:
+    """Holt Video-Seite und extrahiert captions + metadata aus dem HTML."""
+    cache_key = f"videodata:{video_id}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return json.loads(cached)
 
-
-def _get_caption_tracks(video_id: str) -> list[dict]:
-    """Holt Caption Tracks ueber die Innertube Player API."""
     session = _get_session()
-    resp = session.post(
-        f"https://www.youtube.com/youtubei/v1/player?key={INNERTUBE_API_KEY}",
-        json={
-            "context": _innertube_context(),
-            "videoId": video_id,
-        },
+    resp = session.get(
+        f"https://www.youtube.com/watch?v={video_id}",
         timeout=15,
     )
 
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"YouTube API Fehler: {resp.status_code}")
+        raise HTTPException(status_code=502, detail=f"YouTube nicht erreichbar: {resp.status_code}")
 
-    data = resp.json()
+    html = resp.text
 
-    # Check playability
-    playability = data.get("playabilityStatus", {})
-    status = playability.get("status")
-    if status == "ERROR":
-        raise HTTPException(status_code=404, detail="Video nicht verfuegbar.")
-    if status == "LOGIN_REQUIRED":
-        raise HTTPException(status_code=403, detail="Video ist privat oder altersbeschraenkt.")
+    # Bot detection check
+    if "Sign in to confirm" in html or "/sorry/" in html:
+        raise HTTPException(status_code=503, detail="YouTube Bot-Detection aktiv. Bitte spaeter erneut versuchen.")
 
-    captions = data.get("captions", {})
-    renderer = captions.get("playerCaptionsTracklistRenderer", {})
-    tracks = renderer.get("captionTracks", [])
+    # Extract captions
+    captions_match = re.search(r'"captions":(.*?),"videoDetails"', html)
+    caption_tracks = []
+    if captions_match:
+        try:
+            captions = json.loads(captions_match.group(1))
+            caption_tracks = captions.get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+        except json.JSONDecodeError:
+            pass
 
-    return tracks
+    # Extract metadata
+    metadata = {}
+    details_match = re.search(r'"videoDetails":(.*?),"playerConfig"', html)
+    if not details_match:
+        details_match = re.search(r'"videoDetails":(.*?),"annotations"', html)
+    if details_match:
+        try:
+            details = json.loads(details_match.group(1))
+            metadata = {
+                "title": details.get("title"),
+                "author": details.get("author"),
+                "channel_id": details.get("channelId"),
+                "duration": int(details.get("lengthSeconds", 0)),
+                "view_count": int(details.get("viewCount", 0)),
+                "thumbnail": details.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url"),
+            }
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Fallback metadata via oembed
+    if not metadata.get("title"):
+        try:
+            oembed_resp = session.get(
+                f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json",
+                timeout=5,
+            )
+            if oembed_resp.status_code == 200:
+                data = oembed_resp.json()
+                metadata = {
+                    "title": data.get("title"),
+                    "author": data.get("author_name"),
+                    "author_url": data.get("author_url"),
+                    "thumbnail": data.get("thumbnail_url"),
+                }
+        except Exception:
+            pass
+
+    result = {
+        "caption_tracks": caption_tracks,
+        "metadata": metadata,
+    }
+    _cache_set(cache_key, json.dumps(result))
+    return result
 
 
-def _fetch_transcript_from_url(base_url: str) -> list[dict]:
-    """Holt und parst Transkript von einer Caption Track URL."""
-    # JSON3 Format anfordern (strukturiert, einfach zu parsen)
-    url = base_url + "&fmt=json3"
+def _fetch_timedtext(base_url: str) -> list[dict]:
+    """Holt Transkript-Segmente von der timedtext URL."""
+    url = base_url
+    if "fmt=" not in url:
+        url += "&fmt=json3"
+
     session = _get_session()
     resp = session.get(url, timeout=15)
 
@@ -195,9 +228,11 @@ def _fetch_transcript_from_url(base_url: str) -> list[dict]:
     return segments
 
 
-def _fetch_transcript(video_id: str, languages: list[str]) -> tuple[list[dict], str]:
-    """Holt Transkript. Gibt (segments, language_code) zurueck."""
-    tracks = _get_caption_tracks(video_id)
+def _fetch_transcript(video_id: str, languages: list[str]) -> tuple[list[dict], str, dict]:
+    """Holt Transkript. Gibt (segments, language_code, metadata) zurueck."""
+    video_data = _get_video_data(video_id)
+    tracks = video_data.get("caption_tracks", [])
+    metadata = video_data.get("metadata", {})
 
     if not tracks:
         raise HTTPException(
@@ -213,7 +248,7 @@ def _fetch_transcript(video_id: str, languages: list[str]) -> tuple[list[dict], 
         for track in tracks:
             if track.get("languageCode", "").startswith(lang):
                 chosen_track = track
-                chosen_lang = lang
+                chosen_lang = track.get("languageCode", lang)
                 break
         if chosen_track:
             break
@@ -227,40 +262,12 @@ def _fetch_transcript(video_id: str, languages: list[str]) -> tuple[list[dict], 
     if not base_url:
         raise HTTPException(status_code=500, detail="Keine Transkript-URL gefunden.")
 
-    segments = _fetch_transcript_from_url(base_url)
+    segments = _fetch_timedtext(base_url)
 
     if not segments:
         raise HTTPException(status_code=404, detail="Transkript ist leer.")
 
-    return segments, chosen_lang
-
-
-def _get_metadata(video_id: str) -> dict:
-    """Metadaten via oembed API (kein API Key noetig, funktioniert von Datacenter IPs)."""
-    cache_key = f"meta:{video_id}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return json.loads(cached)
-
-    try:
-        session = _get_session()
-        resp = session.get(
-            f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json",
-            timeout=5,
-        )
-        if resp.status_code != 200:
-            return {}
-        data = resp.json()
-        meta = {
-            "title": data.get("title"),
-            "author": data.get("author_name"),
-            "author_url": data.get("author_url"),
-            "thumbnail": data.get("thumbnail_url"),
-        }
-        _cache_set(cache_key, json.dumps(meta))
-        return meta
-    except Exception:
-        return {}
+    return segments, chosen_lang, metadata
 
 
 def _build_result(video_id: str, language: str, segments: list[dict], metadata: dict, fmt: str, timestamps: bool, max_chars: Optional[int]):
@@ -303,8 +310,7 @@ def _build_result(video_id: str, language: str, segments: list[dict], metadata: 
 def root():
     return {
         "service": "YouTube Transcript API",
-        "version": "2.1.0",
-        "backend": "innertube",
+        "version": "3.0.0",
         "endpoints": {
             "GET /transcript": "Transkript eines Videos abrufen",
             "POST /transcript/batch": "Transkripte mehrerer Videos abrufen",
@@ -318,7 +324,7 @@ def root():
 @app.get("/health")
 def health():
     redis_status = "connected" if _get_redis() else ("not configured" if not REDIS_URL else "error")
-    return {"status": "ok", "redis": redis_status, "backend": "innertube"}
+    return {"status": "ok", "redis": redis_status}
 
 
 @app.get("/transcript")
@@ -339,8 +345,7 @@ def get_transcript(
     if cached:
         return json.loads(cached)
 
-    segments, found_lang = _fetch_transcript(video_id, languages)
-    metadata = _get_metadata(video_id)
+    segments, found_lang, metadata = _fetch_transcript(video_id, languages)
     result = _build_result(video_id, found_lang, segments, metadata, format, timestamps, max_chars)
 
     _cache_set(cache_key, json.dumps(result))
@@ -370,8 +375,7 @@ def get_transcripts_batch(
     for video in body.videos:
         try:
             video_id = _extract_video_id(video)
-            segments, found_lang = _fetch_transcript(video_id, languages)
-            metadata = _get_metadata(video_id)
+            segments, found_lang, metadata = _fetch_transcript(video_id, languages)
             entry = _build_result(video_id, found_lang, segments, metadata, body.format, body.timestamps, body.max_chars)
             results.append(entry)
         except HTTPException as e:
@@ -389,8 +393,9 @@ def list_transcripts(
 ):
     _verify_token(credentials)
     video_id = _extract_video_id(video)
-    tracks = _get_caption_tracks(video_id)
-    metadata = _get_metadata(video_id)
+    video_data = _get_video_data(video_id)
+    tracks = video_data.get("caption_tracks", [])
+    metadata = video_data.get("metadata", {})
 
     available = []
     for t in tracks:
